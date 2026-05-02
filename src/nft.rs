@@ -13,6 +13,7 @@ pub fn apply(config: &Config, state: &ControllerState) -> Result<()> {
     delete_table("nft", &["delete", "table", "ip", "xelay_hostfwd"]);
     let host_script = render_host_script(config);
     command::run_input("nft", ["-f", "-"], &host_script)?;
+    ensure_docker_user_rules(config, &SystemNftOps)?;
 
     delete_table_in_namespace(config, &["delete", "table", "inet", "xelay_fwd"]);
     let ns_script = render_namespace_script(config, state);
@@ -24,6 +25,7 @@ pub fn apply(config: &Config, state: &ControllerState) -> Result<()> {
 
 /// Removes only nftables tables owned by this controller.
 pub fn clean(config: &Config) -> Result<()> {
+    clean_docker_user_rules(config, &SystemNftOps)?;
     clean_with(config, &SystemNftOps)
 }
 
@@ -345,7 +347,123 @@ fn delete_table_in_namespace(config: &Config, args: &[&str]) {
 
 /// Minimal nft operations needed for cleanup.
 trait NftOps {
+    fn command_exists(&self, program: &str) -> bool;
     fn run(&self, program: &str, args: &[&str]) -> Result<()>;
+}
+
+/// Installs xelay accept rules into Docker's user-managed forwarding hook.
+fn ensure_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<()> {
+    if !docker_user_chain_exists(ops)? {
+        return Ok(());
+    }
+    if !ops.command_exists("iptables") {
+        anyhow::bail!("Docker DOCKER-USER chain exists but required command `iptables` is missing");
+    }
+
+    for rule in docker_user_rules(config) {
+        ensure_iptables_rule(ops, &rule)?;
+    }
+
+    Ok(())
+}
+
+/// Removes xelay accept rules from Docker's user-managed forwarding hook.
+fn clean_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<()> {
+    if !docker_user_chain_exists(ops)? {
+        return Ok(());
+    }
+    if !ops.command_exists("iptables") {
+        anyhow::bail!("Docker DOCKER-USER chain exists but required command `iptables` is missing");
+    }
+
+    for rule in docker_user_rules(config) {
+        ignore_absent(delete_iptables_rule(ops, &rule))?;
+    }
+
+    Ok(())
+}
+
+fn docker_user_chain_exists(ops: &dyn NftOps) -> Result<bool> {
+    match ops.run("nft", &["list", "chain", "ip", "filter", "DOCKER-USER"]) {
+        Ok(()) => Ok(true),
+        Err(error) if is_absent_cleanup_error(&error.to_string()) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_iptables_rule(ops: &dyn NftOps, rule: &[String]) -> Result<()> {
+    if run_iptables_rule(ops, "-C", rule).is_ok() {
+        return Ok(());
+    }
+    run_iptables_rule(ops, "-I", rule)
+}
+
+fn delete_iptables_rule(ops: &dyn NftOps, rule: &[String]) -> Result<()> {
+    run_iptables_rule(ops, "-D", rule)
+}
+
+fn run_iptables_rule(ops: &dyn NftOps, action: &str, rule: &[String]) -> Result<()> {
+    let mut args = vec![
+        "-w".to_string(),
+        action.to_string(),
+        "DOCKER-USER".to_string(),
+    ];
+    if action == "-I" {
+        args.push("1".to_string());
+    }
+    args.extend(rule.iter().cloned());
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    ops.run("iptables", &arg_refs)
+}
+
+fn docker_user_rules(config: &Config) -> Vec<Vec<String>> {
+    let host_veth = config.host_veth_name();
+    let mut rules = vec![
+        vec![
+            "-i".to_string(),
+            host_veth.clone(),
+            "-o".to_string(),
+            config.host_interface.clone(),
+            "-j".to_string(),
+            "ACCEPT".to_string(),
+        ],
+        vec![
+            "-i".to_string(),
+            config.host_interface.clone(),
+            "-o".to_string(),
+            host_veth.clone(),
+            "-m".to_string(),
+            "conntrack".to_string(),
+            "--ctstate".to_string(),
+            "RELATED,ESTABLISHED".to_string(),
+            "-j".to_string(),
+            "ACCEPT".to_string(),
+        ],
+    ];
+
+    for rule in &config.rules {
+        if !rule.enabled {
+            continue;
+        }
+        for protocol in &rule.protocols {
+            rules.push(vec![
+                "-i".to_string(),
+                config.host_interface.clone(),
+                "-o".to_string(),
+                host_veth.clone(),
+                "-p".to_string(),
+                protocol.as_str().to_string(),
+                "-d".to_string(),
+                config.ns_ip().to_string(),
+                "--dport".to_string(),
+                rule.listen_port.to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
+        }
+    }
+
+    rules
 }
 
 /// Performs best-effort cleanup of xelay-owned nftables tables.
@@ -381,11 +499,18 @@ fn is_absent_cleanup_error(message: &str) -> bool {
     message.contains("no such file")
         || message.contains("does not exist")
         || message.contains("cannot open network namespace")
+        || message.contains("bad rule")
+        || message.contains("matching rule")
+        || message.contains("no chain/target/match")
 }
 
 struct SystemNftOps;
 
 impl NftOps for SystemNftOps {
+    fn command_exists(&self, program: &str) -> bool {
+        command::command_exists(program)
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> Result<()> {
         command::run(program, args.iter().copied()).map(|_| ())
     }
@@ -402,6 +527,9 @@ mod tests {
     #[derive(Default)]
     struct FakeNftOps {
         calls: RefCell<Vec<String>>,
+        docker_user_exists: bool,
+        iptables_exists: bool,
+        iptables_check_succeeds: bool,
     }
 
     struct ErrorNftOps {
@@ -409,15 +537,33 @@ mod tests {
     }
 
     impl NftOps for FakeNftOps {
+        fn command_exists(&self, program: &str) -> bool {
+            program != "iptables" || self.iptables_exists
+        }
+
         fn run(&self, program: &str, args: &[&str]) -> Result<()> {
             self.calls
                 .borrow_mut()
                 .push(format!("{program} {}", args.join(" ")));
+            if program == "nft" && args == ["list", "chain", "ip", "filter", "DOCKER-USER"] {
+                if self.docker_user_exists {
+                    return Ok(());
+                }
+                anyhow::bail!("No such file or directory");
+            }
+            if program == "iptables" && args.get(1) == Some(&"-C") && !self.iptables_check_succeeds
+            {
+                anyhow::bail!("rule is absent");
+            }
             Ok(())
         }
     }
 
     impl NftOps for ErrorNftOps {
+        fn command_exists(&self, _program: &str) -> bool {
+            true
+        }
+
         fn run(&self, _program: &str, _args: &[&str]) -> Result<()> {
             anyhow::bail!("{}", self.message)
         }
@@ -522,6 +668,111 @@ mod tests {
         let script = render_namespace_script(&config, &state);
         assert!(script.contains("ct state new tcp dport 5000 counter name svc_5000_in_tcp drop"));
         assert!(script.contains("udp dport 5000 counter name svc_5000_in_udp drop"));
+    }
+
+    #[test]
+    fn docker_user_rules_cover_inbound_and_namespace_egress() {
+        let rules = docker_user_rules(&sample_config())
+            .into_iter()
+            .map(|rule| rule.join(" "))
+            .collect::<Vec<_>>();
+
+        assert!(rules
+            .iter()
+            .any(|rule| rule == "-i fwd-host -o eth0 -j ACCEPT"));
+        assert!(rules.iter().any(|rule| {
+            rule == "-i eth0 -o fwd-host -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule == "-i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule == "-i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+        }));
+    }
+
+    #[test]
+    fn docker_user_apply_skips_when_chain_is_absent() {
+        let ops = FakeNftOps::default();
+
+        ensure_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls
+            .iter()
+            .any(|c| c == "nft list chain ip filter DOCKER-USER"));
+        assert!(!calls.iter().any(|c| c.starts_with("iptables ")));
+    }
+
+    #[test]
+    fn docker_user_apply_inserts_missing_rules() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: true,
+            iptables_check_succeeds: false,
+            calls: RefCell::new(Vec::new()),
+        };
+
+        ensure_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls.iter().any(|c| {
+            c == "iptables -w -C DOCKER-USER -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+        }));
+        assert!(calls.iter().any(|c| {
+            c == "iptables -w -I DOCKER-USER 1 -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+        }));
+        assert!(calls
+            .iter()
+            .any(|c| c == "iptables -w -I DOCKER-USER 1 -i fwd-host -o eth0 -j ACCEPT"));
+    }
+
+    #[test]
+    fn docker_user_apply_does_not_duplicate_existing_rules() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: true,
+            iptables_check_succeeds: true,
+            calls: RefCell::new(Vec::new()),
+        };
+
+        ensure_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls.iter().any(|c| c.starts_with("iptables -w -C ")));
+        assert!(!calls.iter().any(|c| c.starts_with("iptables -w -I ")));
+    }
+
+    #[test]
+    fn docker_user_apply_requires_iptables_when_chain_exists() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: false,
+            iptables_check_succeeds: false,
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let error = ensure_docker_user_rules(&sample_config(), &ops)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("iptables"));
+    }
+
+    #[test]
+    fn docker_user_clean_deletes_matching_rules() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: true,
+            iptables_check_succeeds: false,
+            calls: RefCell::new(Vec::new()),
+        };
+
+        clean_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls.iter().any(|c| {
+            c == "iptables -w -D DOCKER-USER -i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+        }));
     }
 
     #[test]

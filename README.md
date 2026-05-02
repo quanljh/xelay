@@ -30,6 +30,7 @@ Automatic mode chooses `run` when any enabled rule defines `quota_in`, `quota_ou
 
 - `ip`
 - `nft`
+- `iptables` when Docker's `DOCKER-USER` chain exists
 - `conntrack`
 - `sysctl`
 
@@ -131,6 +132,11 @@ table ip xelay_hostfwd {
 }
 ```
 
+If Docker is installed, Docker may also create an `ip filter` `FORWARD` chain with
+`policy drop`. When the Docker `DOCKER-USER` chain exists, `xelay` installs matching
+accept rules there with `iptables -w` so forwarded traffic can reach the namespace
+without editing Docker-managed chains.
+
 Inside the namespace, it deletes the old forwarding table if present:
 
 ```bash
@@ -203,6 +209,7 @@ On each apply/reconcile pass, it recreates its managed tables and installs:
 
 - host-side masquerade rules
 - host-side DNAT rules into the forwarding namespace
+- Docker `DOCKER-USER` accept rules when Docker's forwarding hook exists
 - namespace-side DNAT rules to backend targets
 - namespace-side filter rules
 - named nftables counters for inbound and outbound accounting
@@ -218,6 +225,7 @@ xelay --config config.json clean
 This removes only xelay-owned networking state:
 
 - host nftables tables `xelay_hostnat` and `xelay_hostfwd`
+- xelay accept rules from Docker's `DOCKER-USER` chain when it exists
 - namespace nftables table `xelay_fwd`
 - the configured network namespace and any leftover host-side veth link
 
