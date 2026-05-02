@@ -185,17 +185,13 @@ fn render_namespace_script(config: &Config, state: &ControllerState) -> String {
     script.push_str(
         " chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n",
     );
-    script.push_str(&format!(
-        "  oifname != \"{}\" masquerade\n",
-        config.ns_veth_name()
-    ));
     for rule in &config.rules {
         if !is_rule_active(rule, state.rule_state(&rule.name)) {
             continue;
         }
         for protocol in &rule.protocols {
             script.push_str(&format!(
-                "  ip daddr {} {} sport {} counter name {} accept\n",
+                "  ip daddr {} {} dport {} counter name {} masquerade\n",
                 rule.target_host,
                 protocol.as_str(),
                 rule.target_port,
@@ -655,8 +651,13 @@ mod tests {
         ));
         assert!(script.contains("ip daddr 114.111.191.26 tcp dport 2616 accept"));
         assert!(script.contains(
-            "ip daddr 114.111.191.26 tcp sport 2616 counter name svc_5000_out_tcp accept"
+            "ip daddr 114.111.191.26 tcp dport 2616 counter name svc_5000_out_tcp masquerade"
         ));
+        assert!(script.contains(
+            "ip daddr 114.111.191.26 udp dport 2616 counter name svc_5000_out_udp masquerade"
+        ));
+        assert!(!script.contains("tcp sport 2616 counter name svc_5000_out_tcp"));
+        assert!(!script.contains("oifname != \"fwd-ns\" masquerade"));
     }
 
     #[test]

@@ -1,0 +1,14 @@
+[Unit]
+Description=Xelay namespace-isolated port forwarding controller
+Documentation=file:/usr/local/share/doc/xelay/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xelay --config /etc/config/xelay/config.json run
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

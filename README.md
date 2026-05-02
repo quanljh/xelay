@@ -164,9 +164,8 @@ table inet xelay_fwd {
  }
 
  chain postrouting { type nat hook postrouting priority srcnat; policy accept;
-  oifname != "fwd-ns" masquerade
-  ip daddr 114.111.191.26 tcp sport 2616 counter name svc_5000_out_tcp accept
-  ip daddr 114.111.191.26 udp sport 2616 counter name svc_5000_out_udp accept
+  ip daddr 114.111.191.26 tcp dport 2616 counter name svc_5000_out_tcp masquerade
+  ip daddr 114.111.191.26 udp dport 2616 counter name svc_5000_out_udp masquerade
  }
 }
 ```
@@ -231,6 +230,61 @@ This removes only xelay-owned networking state:
 
 The configured state file is preserved so quota and runtime history remain available
 for later inspection or reuse.
+
+## systemd Service
+
+Use the provided unit file to recreate namespace, veth, nftables, Docker hook, and
+runtime routes after reboot.
+
+Build and install the binary:
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/xelay /usr/local/bin/xelay
+```
+
+Install and edit the config:
+
+```bash
+sudo install -d /etc/config/xelay
+sudo install -m 0644 config.example.json /etc/config/xelay/config.json
+sudo nano /etc/config/xelay/config.json
+```
+
+At minimum, set:
+
+- `host_interface` to the host's external interface, such as `eth0` or `ens3`
+- each rule's `listen_port`
+- each rule's `protocols`
+- each rule's `target_host`
+- each rule's `target_port`
+
+Install and enable the service:
+
+```bash
+sudo install -m 0644 contrib/systemd/xelay.service /etc/systemd/system/xelay.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now xelay
+```
+
+Check service status and logs:
+
+```bash
+sudo systemctl status xelay
+sudo journalctl -u xelay -f
+```
+
+The service runs:
+
+```bash
+/usr/local/bin/xelay --config /etc/config/xelay/config.json run
+```
+
+It is ordered after `network-online.target` and `docker.service`. If Docker is
+installed, this gives Docker a chance to create `DOCKER-USER` before xelay installs
+its accept rules. Stopping the service does not clean the dataplane; use
+`xelay --config /etc/config/xelay/config.json clean` when you intentionally want to
+remove xelay networking state.
 
 ## Quotas And Limits
 
