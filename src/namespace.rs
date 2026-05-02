@@ -11,6 +11,11 @@ pub fn ensure(config: &Config) -> Result<()> {
     ensure_with(config, &SystemNamespaceOps)
 }
 
+/// Removes the forwarding namespace and any leftover host-side veth link.
+pub fn clean(config: &Config) -> Result<()> {
+    clean_with(config, &SystemNamespaceOps)
+}
+
 /// Minimal host operations needed to set up namespace networking.
 ///
 /// The production implementation shells out to Linux tools; tests inject a fake
@@ -142,6 +147,20 @@ fn ensure_with(config: &Config, ops: &dyn NamespaceOps) -> Result<()> {
     Ok(())
 }
 
+/// Performs idempotent namespace cleanup using the supplied operation backend.
+fn clean_with(config: &Config, ops: &dyn NamespaceOps) -> Result<()> {
+    let host_veth = config.host_veth_name();
+    if ops.link_exists(&host_veth)? {
+        ops.run("ip", &["link", "delete", host_veth.as_str()])?;
+    }
+
+    if ops.namespace_exists(&config.namespace)? {
+        ops.run("ip", &["netns", "delete", config.namespace.as_str()])?;
+    }
+
+    Ok(())
+}
+
 /// Production namespace operation backend backed by `ip` and `sysctl`.
 struct SystemNamespaceOps;
 
@@ -268,5 +287,30 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.contains("addr replace 10.200.0.1/30 dev fwd-host")));
+    }
+
+    #[test]
+    fn clean_deletes_existing_host_veth_and_namespace() {
+        let ops = FakeNamespaceOps {
+            namespace_exists: true,
+            link_exists: true,
+            link_exists_in_namespace: false,
+            calls: RefCell::new(Vec::new()),
+        };
+
+        clean_with(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls.iter().any(|c| c == "ip link delete fwd-host"));
+        assert!(calls.iter().any(|c| c == "ip netns delete fwd"));
+    }
+
+    #[test]
+    fn clean_is_noop_when_objects_are_absent() {
+        let ops = FakeNamespaceOps::default();
+
+        clean_with(&sample_config(), &ops).unwrap();
+
+        assert!(ops.calls.borrow().is_empty());
     }
 }

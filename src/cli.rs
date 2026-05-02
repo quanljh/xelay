@@ -24,6 +24,7 @@ pub enum Commands {
     Run,
     Status,
     Check,
+    Clean,
 }
 
 /// Current-directory config fallback used when `--config` is omitted.
@@ -276,5 +277,11 @@ mod tests {
     fn cli_still_accepts_explicit_subcommands() {
         let cli = Cli::try_parse_from(["xelay", "apply"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Apply)));
+    }
+
+    #[test]
+    fn cli_accepts_clean_subcommand() {
+        let cli = Cli::try_parse_from(["xelay", "clean"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Clean)));
     }
 }

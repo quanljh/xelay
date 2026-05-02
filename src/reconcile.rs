@@ -80,6 +80,13 @@ impl Reconciler {
         self.check_with(command::command_exists)
     }
 
+    /// Removes xelay-owned nftables tables and namespace networking.
+    pub fn clean(&self) -> Result<()> {
+        self.check_clean_requirements()?;
+        nft::clean(&self.config)?;
+        namespace::clean(&self.config)
+    }
+
     /// Testable variant of `check` with injectable command discovery.
     fn check_with<F>(&self, command_exists: F) -> Result<CheckReport>
     where
@@ -145,6 +152,16 @@ impl Reconciler {
     /// Fails early if the host lacks the external tools this controller shells out to.
     fn check_requirements(&self) -> Result<()> {
         for program in ["ip", "nft", "conntrack", "sysctl"] {
+            if !command::command_exists(program) {
+                anyhow::bail!("required command `{program}` is missing");
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails early if cleanup dependencies are unavailable.
+    fn check_clean_requirements(&self) -> Result<()> {
+        for program in ["ip", "nft"] {
             if !command::command_exists(program) {
                 anyhow::bail!("required command `{program}` is missing");
             }

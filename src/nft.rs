@@ -22,6 +22,11 @@ pub fn apply(config: &Config, state: &ControllerState) -> Result<()> {
     Ok(())
 }
 
+/// Removes only nftables tables owned by this controller.
+pub fn clean(config: &Config) -> Result<()> {
+    clean_with(config, &SystemNftOps)
+}
+
 /// Reads named nftables counters from the forwarding namespace.
 ///
 /// Counter values are raw kernel totals; callers merge them with persisted baselines
@@ -222,7 +227,7 @@ fn push_prerouting_rule(
 
         if state.accepting_new() {
             script.push_str(&format!(
-                "  ct state new {} dport {} counter name {} dnat to {}:{}\n",
+                "  ct state new {} dport {} counter name {} dnat ip to {}:{}\n",
                 protocol.as_str(),
                 rule.listen_port,
                 in_counter,
@@ -338,11 +343,85 @@ fn delete_table_in_namespace(config: &Config, args: &[&str]) {
     let _ = command::run("ip", command_args);
 }
 
+/// Minimal nft operations needed for cleanup.
+trait NftOps {
+    fn run(&self, program: &str, args: &[&str]) -> Result<()>;
+}
+
+/// Performs best-effort cleanup of xelay-owned nftables tables.
+fn clean_with(config: &Config, ops: &dyn NftOps) -> Result<()> {
+    ignore_absent(ops.run("nft", &["delete", "table", "ip", "xelay_hostnat"]))?;
+    ignore_absent(ops.run("nft", &["delete", "table", "ip", "xelay_hostfwd"]))?;
+    ignore_absent(ops.run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            config.namespace.as_str(),
+            "nft",
+            "delete",
+            "table",
+            "inet",
+            "xelay_fwd",
+        ],
+    ))?;
+    Ok(())
+}
+
+fn ignore_absent(result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_absent_cleanup_error(&error.to_string()) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_absent_cleanup_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no such file")
+        || message.contains("does not exist")
+        || message.contains("cannot open network namespace")
+}
+
+struct SystemNftOps;
+
+impl NftOps for SystemNftOps {
+    fn run(&self, program: &str, args: &[&str]) -> Result<()> {
+        command::run(program, args.iter().copied()).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::config::{Protocol, Quota};
     use crate::state::RuleEntryState;
+
+    #[derive(Default)]
+    struct FakeNftOps {
+        calls: RefCell<Vec<String>>,
+    }
+
+    struct ErrorNftOps {
+        message: &'static str,
+    }
+
+    impl NftOps for FakeNftOps {
+        fn run(&self, program: &str, args: &[&str]) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        }
+    }
+
+    impl NftOps for ErrorNftOps {
+        fn run(&self, _program: &str, _args: &[&str]) -> Result<()> {
+            anyhow::bail!("{}", self.message)
+        }
+    }
 
     fn sample_config() -> Config {
         Config {
@@ -426,7 +505,7 @@ mod tests {
         let script = render_namespace_script(&config, &state);
         assert!(script.contains("counter svc_5000_in_tcp { }"));
         assert!(script.contains(
-            "ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat to 114.111.191.26:2616"
+            "ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat ip to 114.111.191.26:2616"
         ));
         assert!(script.contains("ip daddr 114.111.191.26 tcp dport 2616 accept"));
         assert!(script.contains(
@@ -443,6 +522,43 @@ mod tests {
         let script = render_namespace_script(&config, &state);
         assert!(script.contains("ct state new tcp dport 5000 counter name svc_5000_in_tcp drop"));
         assert!(script.contains("udp dport 5000 counter name svc_5000_in_udp drop"));
+    }
+
+    #[test]
+    fn clean_deletes_managed_host_and_namespace_tables() {
+        let ops = FakeNftOps::default();
+
+        clean_with(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls
+            .iter()
+            .any(|c| c == "nft delete table ip xelay_hostnat"));
+        assert!(calls
+            .iter()
+            .any(|c| c == "nft delete table ip xelay_hostfwd"));
+        assert!(calls
+            .iter()
+            .any(|c| c == "ip netns exec fwd nft delete table inet xelay_fwd"));
+    }
+
+    #[test]
+    fn clean_ignores_absent_managed_tables() {
+        let ops = ErrorNftOps {
+            message: "No such file or directory",
+        };
+
+        clean_with(&sample_config(), &ops).unwrap();
+    }
+
+    #[test]
+    fn clean_reports_unexpected_nft_errors() {
+        let ops = ErrorNftOps {
+            message: "permission denied",
+        };
+
+        let error = clean_with(&sample_config(), &ops).unwrap_err().to_string();
+        assert!(error.contains("permission denied"));
     }
 
     #[test]

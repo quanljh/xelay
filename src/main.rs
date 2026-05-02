@@ -51,6 +51,11 @@ fn run_cli() -> Result<()> {
             print!("{output}");
             logger.log(&output)
         }
+        Some(Commands::Clean) => {
+            logger.log_line("clean started")?;
+            reconciler.clean()?;
+            logger.log_line("clean completed")
+        }
         None if auto_requires_monitoring => {
             logger.log_line("auto mode selected run")?;
             run_with_logger(&mut reconciler, &mut logger)

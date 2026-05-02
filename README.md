@@ -12,6 +12,7 @@ xelay --config config.json apply
 xelay --config config.json run
 xelay --config config.json status
 xelay --config config.json check
+xelay --config config.json clean
 ```
 
 - no subcommand: loads config from `./config.json` or `/etc/config/xelay/config.json`, then chooses `apply` or `run` automatically.
@@ -19,6 +20,7 @@ xelay --config config.json check
 - `run`: continuously reconciles at the configured polling interval.
 - `status`: prints rule state, byte counters, quotas, and flow counts.
 - `check`: verifies required external Linux tools are available.
+- `clean`: removes xelay-owned nftables tables and the configured network namespace.
 
 Automatic mode chooses `run` when any enabled rule defines `quota_in`, `quota_out`, `max_tcp_connections`, or `max_udp_flows`. If no enabled rule has limits, it performs `apply` once.
 
@@ -145,8 +147,8 @@ table inet xelay_fwd {
  counter svc_5000_out_udp { }
 
  chain prerouting { type nat hook prerouting priority dstnat; policy accept;
-  ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat to 114.111.191.26:2616
-  ct state new udp dport 5000 counter name svc_5000_in_udp dnat to 114.111.191.26:2616
+  ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat ip to 114.111.191.26:2616
+  ct state new udp dport 5000 counter name svc_5000_in_udp dnat ip to 114.111.191.26:2616
  }
 
  chain forward { type filter hook forward priority filter; policy drop;
@@ -204,6 +206,23 @@ On each apply/reconcile pass, it recreates its managed tables and installs:
 - namespace-side DNAT rules to backend targets
 - namespace-side filter rules
 - named nftables counters for inbound and outbound accounting
+
+## Cleanup
+
+Use `clean` to tear down the forwarding infrastructure created by `apply` or `run`:
+
+```bash
+xelay --config config.json clean
+```
+
+This removes only xelay-owned networking state:
+
+- host nftables tables `xelay_hostnat` and `xelay_hostfwd`
+- namespace nftables table `xelay_fwd`
+- the configured network namespace and any leftover host-side veth link
+
+The configured state file is preserved so quota and runtime history remain available
+for later inspection or reuse.
 
 ## Quotas And Limits
 
