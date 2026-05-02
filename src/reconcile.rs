@@ -33,8 +33,17 @@ impl Reconciler {
     ///
     /// This is the daemon-style mode that enforces quotas and connection limits.
     pub fn run(&mut self) -> Result<()> {
+        self.run_with_log(|| Ok(()))
+    }
+
+    /// Reconciles forever and invokes `on_pass` after each successful pass.
+    pub fn run_with_log<F>(&mut self, mut on_pass: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         loop {
             self.ensure_runtime()?;
+            on_pass()?;
             thread::sleep(Duration::from_secs(self.config.poll_interval_secs));
         }
     }
@@ -50,7 +59,13 @@ impl Reconciler {
             let counters = state.ensure_rule(&rule.name).counters.clone();
             let flows = conntrack::count_flows(&self.config.namespace, rule).unwrap_or_default();
             let runtime = state.ensure_rule(&rule.name).runtime.clone();
-            rules.push(RuleStatus::from_parts(rule, counters.in_bytes, counters.out_bytes, flows, runtime));
+            rules.push(RuleStatus::from_parts(
+                rule,
+                counters.in_bytes,
+                counters.out_bytes,
+                flows,
+                runtime,
+            ));
         }
 
         Ok(StatusReport {
@@ -110,12 +125,18 @@ impl Reconciler {
     /// Updates each rule's runtime state from counters, config, and live flow counts.
     fn refresh_rule_states(&self, state: &mut ControllerState) -> Result<()> {
         for rule in &self.config.rules {
-            let flows = conntrack::count_flows(&self.config.namespace, rule).unwrap_or(FlowCounts {
-                tcp_connections: 0,
-                udp_flows: 0,
-            });
+            let flows =
+                conntrack::count_flows(&self.config.namespace, rule).unwrap_or(FlowCounts {
+                    tcp_connections: 0,
+                    udp_flows: 0,
+                });
             let entry = state.ensure_rule(&rule.name);
-            entry.runtime = decide_rule_state(rule, entry.counters.in_bytes, entry.counters.out_bytes, flows);
+            entry.runtime = decide_rule_state(
+                rule,
+                entry.counters.in_bytes,
+                entry.counters.out_bytes,
+                flows,
+            );
         }
 
         Ok(())
@@ -146,7 +167,9 @@ fn decide_rule_state(
         return RuleRuntimeState::disabled_by_config();
     }
 
-    if in_bytes >= rule.quota_in.0 || out_bytes >= rule.quota_out.0 {
+    if rule.quota_in.is_some_and(|quota| in_bytes >= quota.0)
+        || rule.quota_out.is_some_and(|quota| out_bytes >= quota.0)
+    {
         return RuleRuntimeState::quota_blocked();
     }
 
@@ -178,9 +201,9 @@ pub struct RuleStatus {
     pub target_port: u16,
     pub protocols: Vec<String>,
     pub in_bytes: u64,
-    pub in_quota: u64,
+    pub in_quota: Option<u64>,
     pub out_bytes: u64,
-    pub out_quota: u64,
+    pub out_quota: Option<u64>,
     pub tcp_connections: u32,
     pub max_tcp_connections: u32,
     pub udp_flows: u32,
@@ -201,11 +224,15 @@ impl RuleStatus {
             state: runtime.reason,
             target_host: rule.target_host.clone(),
             target_port: rule.target_port,
-            protocols: rule.protocols.iter().map(|p| p.as_str().to_string()).collect(),
+            protocols: rule
+                .protocols
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect(),
             in_bytes,
-            in_quota: rule.quota_in.0,
+            in_quota: rule.quota_in.map(|quota| quota.0),
             out_bytes,
-            out_quota: rule.quota_out.0,
+            out_quota: rule.quota_out.map(|quota| quota.0),
             tcp_connections: flows.tcp_connections,
             max_tcp_connections: rule.max_tcp_connections,
             udp_flows: flows.udp_flows,
@@ -240,8 +267,8 @@ mod tests {
             target: None,
             target_host: "1.2.3.4".to_string(),
             target_port: 80,
-            quota_in: Quota(100),
-            quota_out: Quota(100),
+            quota_in: Some(Quota(100)),
+            quota_out: Some(Quota(100)),
             max_tcp_connections: 10,
             max_udp_flows: 20,
             enabled: true,
@@ -255,6 +282,7 @@ mod tests {
             host_veth_ip: "10.200.0.1/30".to_string(),
             ns_veth_ip: "10.200.0.2/30".to_string(),
             state_path: "/tmp/xelay-state.json".into(),
+            log_path: None,
             poll_interval_secs: 2,
             rules: vec![sample_rule()],
         }
@@ -264,7 +292,15 @@ mod tests {
     fn decide_rule_state_prefers_disabled_by_config() {
         let mut rule = sample_rule();
         rule.enabled = false;
-        let state = decide_rule_state(&rule, 1000, 1000, FlowCounts { tcp_connections: 100, udp_flows: 100 });
+        let state = decide_rule_state(
+            &rule,
+            1000,
+            1000,
+            FlowCounts {
+                tcp_connections: 100,
+                udp_flows: 100,
+            },
+        );
         assert_eq!(state.reason, "disabled-by-config");
     }
 
@@ -318,6 +354,15 @@ mod tests {
                 udp_flows: 19,
             },
         );
+        assert_eq!(state.reason, "enabled");
+    }
+
+    #[test]
+    fn decide_rule_state_ignores_missing_quotas() {
+        let mut rule = sample_rule();
+        rule.quota_in = None;
+        rule.quota_out = None;
+        let state = decide_rule_state(&rule, u64::MAX, u64::MAX, FlowCounts::default());
         assert_eq!(state.reason, "enabled");
     }
 

@@ -21,6 +21,8 @@ pub struct Config {
     pub ns_veth_ip: String,
     #[serde(default = "default_state_path")]
     pub state_path: PathBuf,
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
     pub rules: Vec<RuleConfig>,
@@ -38,8 +40,10 @@ pub struct RuleConfig {
     pub target_host: String,
     #[serde(default)]
     pub target_port: u16,
-    pub quota_in: Quota,
-    pub quota_out: Quota,
+    #[serde(default)]
+    pub quota_in: Option<Quota>,
+    #[serde(default)]
+    pub quota_out: Option<Quota>,
     #[serde(default)]
     pub max_tcp_connections: u32,
     #[serde(default)]
@@ -227,6 +231,24 @@ impl Config {
             .next()
             .unwrap_or(self.ns_veth_ip.as_str())
     }
+
+    /// Returns whether the config needs the long-running monitor loop.
+    pub fn requires_monitoring(&self) -> bool {
+        self.rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .any(RuleConfig::has_limits)
+    }
+}
+
+impl RuleConfig {
+    /// Returns whether this rule has quota or connection limits.
+    pub fn has_limits(&self) -> bool {
+        self.quota_in.is_some()
+            || self.quota_out.is_some()
+            || self.max_tcp_connections > 0
+            || self.max_udp_flows > 0
+    }
 }
 
 /// Builds a Linux interface name within the 15-byte limit.
@@ -404,5 +426,120 @@ mod tests {
         assert_eq!(config.ns_veth_name(), "fwd-ns");
         assert_eq!(config.ns_host_ip(), "10.200.0.1");
         assert_eq!(config.ns_ip(), "10.200.0.2");
+    }
+
+    #[test]
+    fn config_deserializes_optional_log_path() {
+        let raw = r#"{
+            "namespace": "fwd",
+            "host_interface": "eth0",
+            "log_path": "/var/log/xelay.log",
+            "rules": [{
+                "name": "svc-5000",
+                "listen_port": 5000,
+                "protocols": ["tcp"],
+                "target_host": "114.111.191.26",
+                "target_port": 2616,
+                "quota_in": "1GB",
+                "quota_out": "1GB"
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            config.log_path.unwrap(),
+            PathBuf::from("/var/log/xelay.log")
+        );
+    }
+
+    #[test]
+    fn config_defaults_log_path_to_none() {
+        let config: Config = serde_json::from_str(&base_rule_json()).unwrap();
+        assert!(config.log_path.is_none());
+    }
+
+    #[test]
+    fn config_allows_missing_quotas() {
+        let raw = r#"{
+            "namespace": "fwd",
+            "host_interface": "eth0",
+            "rules": [{
+                "name": "svc-5000",
+                "listen_port": 5000,
+                "protocols": ["tcp"],
+                "target_host": "114.111.191.26",
+                "target_port": 2616
+            }]
+        }"#;
+
+        let mut config: Config = serde_json::from_str(raw).unwrap();
+        config.normalize_targets().unwrap();
+        config.validate().unwrap();
+        assert!(config.rules[0].quota_in.is_none());
+        assert!(config.rules[0].quota_out.is_none());
+    }
+
+    #[test]
+    fn requires_monitoring_detects_enabled_limits() {
+        let config: Config = serde_json::from_str(&base_rule_json()).unwrap();
+        assert!(config.requires_monitoring());
+    }
+
+    #[test]
+    fn requires_monitoring_ignores_unlimited_rules() {
+        let raw = r#"{
+            "namespace": "fwd",
+            "host_interface": "eth0",
+            "rules": [{
+                "name": "svc-5000",
+                "listen_port": 5000,
+                "protocols": ["tcp"],
+                "target_host": "114.111.191.26",
+                "target_port": 2616
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert!(!config.requires_monitoring());
+    }
+
+    #[test]
+    fn requires_monitoring_ignores_disabled_rules_with_limits() {
+        let raw = r#"{
+            "namespace": "fwd",
+            "host_interface": "eth0",
+            "rules": [{
+                "name": "svc-5000",
+                "listen_port": 5000,
+                "protocols": ["tcp"],
+                "target_host": "114.111.191.26",
+                "target_port": 2616,
+                "quota_in": "1GB",
+                "max_tcp_connections": 10,
+                "enabled": false
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert!(!config.requires_monitoring());
+    }
+
+    #[test]
+    fn requires_monitoring_detects_connection_limits() {
+        let raw = r#"{
+            "namespace": "fwd",
+            "host_interface": "eth0",
+            "rules": [{
+                "name": "svc-5000",
+                "listen_port": 5000,
+                "protocols": ["tcp"],
+                "target_host": "114.111.191.26",
+                "target_port": 2616,
+                "max_udp_flows": 1
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(raw).unwrap();
+        assert!(config.requires_monitoring());
     }
 }

@@ -15,17 +15,7 @@ pub struct FlowCounts {
 /// This shells out to `ip netns exec <ns> conntrack -L -n` and then matches the
 /// backend target tuple used by the rule.
 pub fn count_flows(namespace: &str, rule: &RuleConfig) -> Result<FlowCounts> {
-    let output = command::run(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace,
-            "conntrack",
-            "-L",
-            "-n",
-        ],
-    )?;
+    let output = command::run("ip", ["netns", "exec", namespace, "conntrack", "-L", "-n"])?;
 
     Ok(count_flows_from_output(&output.stdout, rule))
 }
@@ -66,8 +56,8 @@ mod tests {
             target: None,
             target_host: "114.111.191.26".to_string(),
             target_port: 2616,
-            quota_in: Quota(1024),
-            quota_out: Quota(1024),
+            quota_in: Some(Quota(1024)),
+            quota_out: Some(Quota(1024)),
             max_tcp_connections: 100,
             max_udp_flows: 100,
             enabled: true,
@@ -79,7 +69,8 @@ mod tests {
         let output = "\
 tcp      6 431999 ESTABLISHED src=1.1.1.1 dst=10.0.0.2 sport=50000 dport=2616 src=114.111.191.26 dst=1.1.1.1 sport=2616 dport=50000 [ASSURED]\n\
 udp      17 29 src=1.1.1.1 dst=10.0.0.2 sport=50001 dport=2616 src=114.111.191.26 dst=1.1.1.1 sport=2616 dport=50001 [UNREPLIED]\n";
-        let counts = count_flows_from_output(output, &sample_rule(vec![Protocol::Tcp, Protocol::Udp]));
+        let counts =
+            count_flows_from_output(output, &sample_rule(vec![Protocol::Tcp, Protocol::Udp]));
         assert_eq!(counts.tcp_connections, 1);
         assert_eq!(counts.udp_flows, 1);
     }
@@ -89,7 +80,8 @@ udp      17 29 src=1.1.1.1 dst=10.0.0.2 sport=50001 dport=2616 src=114.111.191.2
         let output = "\
 tcp      6 431999 ESTABLISHED src=1.1.1.1 dst=10.0.0.2 sport=50000 dport=9999 src=114.111.191.26 dst=1.1.1.1 sport=2616 dport=50000 [ASSURED]\n\
 udp      17 29 src=1.1.1.1 dst=10.0.0.2 sport=50001 dport=2616 src=114.111.191.99 dst=1.1.1.1 sport=2616 dport=50001 [UNREPLIED]\n";
-        let counts = count_flows_from_output(output, &sample_rule(vec![Protocol::Tcp, Protocol::Udp]));
+        let counts =
+            count_flows_from_output(output, &sample_rule(vec![Protocol::Tcp, Protocol::Udp]));
         assert_eq!(counts.tcp_connections, 0);
         assert_eq!(counts.udp_flows, 0);
     }

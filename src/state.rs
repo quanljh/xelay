@@ -23,8 +23,9 @@ impl RuleStateFile {
     /// counters after a reconciliation pass.
     pub fn load(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create state directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create state directory {}", parent.display())
+            })?;
         }
 
         if path.exists() {

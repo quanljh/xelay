@@ -220,6 +220,7 @@ mod tests {
             host_veth_ip: "10.200.0.1/30".to_string(),
             ns_veth_ip: "10.200.0.2/30".to_string(),
             state_path: "/tmp/xelay-state.json".into(),
+            log_path: None,
             poll_interval_secs: 2,
             rules: vec![RuleConfig {
                 name: "svc".to_string(),
@@ -228,8 +229,8 @@ mod tests {
                 target: None,
                 target_host: "1.2.3.4".to_string(),
                 target_port: 80,
-                quota_in: Quota(1),
-                quota_out: Quota(1),
+                quota_in: Some(Quota(1)),
+                quota_out: Some(Quota(1)),
                 max_tcp_connections: 1,
                 max_udp_flows: 1,
                 enabled: true,
@@ -243,8 +244,12 @@ mod tests {
         ensure_with(&sample_config(), &ops).unwrap();
         let calls = ops.calls.borrow();
         assert!(calls.iter().any(|c| c.contains("ip netns add fwd")));
-        assert!(calls.iter().any(|c| c.contains("ip link add fwd-host type veth peer name fwd-ns")));
-        assert!(calls.iter().any(|c| c.contains("sysctl -w net.ipv4.ip_forward=1")));
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("ip link add fwd-host type veth peer name fwd-ns")));
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("sysctl -w net.ipv4.ip_forward=1")));
     }
 
     #[test]
@@ -260,6 +265,8 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("netns add")));
         assert!(!calls.iter().any(|c| c.contains("link add")));
         assert!(!calls.iter().any(|c| c.contains("link set fwd-ns netns")));
-        assert!(calls.iter().any(|c| c.contains("addr replace 10.200.0.1/30 dev fwd-host")));
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("addr replace 10.200.0.1/30 dev fwd-host")));
     }
 }

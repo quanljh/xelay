@@ -4,6 +4,7 @@
   "host_veth_ip": "10.200.0.1/30",
   "ns_veth_ip": "10.200.0.2/30",
   "state_path": "/var/lib/xelay/state.json",
+  "log_path": "/var/log/xelay.log",
   "poll_interval_secs": 2,
   "rules": [
     {

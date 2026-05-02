@@ -103,14 +103,17 @@ fn collect_counters(value: &serde_json::Value, samples: &mut Vec<CounterSample>)
 fn render_host_script(config: &Config) -> String {
     let mut script = String::new();
     script.push_str("table ip xelay_hostnat {\n");
-    script.push_str(" chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n");
+    script.push_str(
+        " chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n",
+    );
     script.push_str(&format!(
         "  oifname \"{}\" ip saddr {} masquerade\n",
         config.host_interface, config.host_veth_ip
     ));
     script.push_str(" }\n}\n");
     script.push_str("table ip xelay_hostfwd {\n");
-    script.push_str(" chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n");
+    script
+        .push_str(" chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n");
     for rule in &config.rules {
         for protocol in &rule.protocols {
             if !rule.enabled {
@@ -138,11 +141,18 @@ fn render_namespace_script(config: &Config, state: &ControllerState) -> String {
     script.push_str("table inet xelay_fwd {\n");
     for rule in &config.rules {
         for protocol in &rule.protocols {
-            script.push_str(&format!(" counter {} {{ }}\n", counter_name(rule, protocol, "in")));
-            script.push_str(&format!(" counter {} {{ }}\n", counter_name(rule, protocol, "out")));
+            script.push_str(&format!(
+                " counter {} {{ }}\n",
+                counter_name(rule, protocol, "in")
+            ));
+            script.push_str(&format!(
+                " counter {} {{ }}\n",
+                counter_name(rule, protocol, "out")
+            ));
         }
     }
-    script.push_str(" chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n");
+    script
+        .push_str(" chain prerouting { type nat hook prerouting priority dstnat; policy accept;\n");
 
     for rule in &config.rules {
         let runtime = state.rule_state(&rule.name);
@@ -165,7 +175,9 @@ fn render_namespace_script(config: &Config, state: &ControllerState) -> String {
         }
     }
     script.push_str(" }\n");
-    script.push_str(" chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n");
+    script.push_str(
+        " chain postrouting { type nat hook postrouting priority srcnat; policy accept;\n",
+    );
     script.push_str(&format!(
         "  oifname != \"{}\" masquerade\n",
         config.ns_veth_name()
@@ -193,7 +205,11 @@ fn render_namespace_script(config: &Config, state: &ControllerState) -> String {
 ///
 /// Enabled rules DNAT new flows. Blocked rules drop new TCP while established TCP is
 /// allowed to drain through conntrack, and drop UDP immediately.
-fn push_prerouting_rule(script: &mut String, rule: &RuleConfig, runtime: Option<&RuleRuntimeState>) {
+fn push_prerouting_rule(
+    script: &mut String,
+    rule: &RuleConfig,
+    runtime: Option<&RuleRuntimeState>,
+) {
     for protocol in &rule.protocols {
         let in_counter = counter_name(rule, protocol, "in");
         let state = runtime.cloned().unwrap_or_else(|| {
@@ -216,14 +232,17 @@ fn push_prerouting_rule(script: &mut String, rule: &RuleConfig, runtime: Option<
         } else {
             let predicate = match protocol {
                 Protocol::Tcp if state.forwarding_enabled() => {
-                    format!("ct state new {} dport {}", protocol.as_str(), rule.listen_port)
+                    format!(
+                        "ct state new {} dport {}",
+                        protocol.as_str(),
+                        rule.listen_port
+                    )
                 }
                 _ => format!("{} dport {}", protocol.as_str(), rule.listen_port),
             };
             script.push_str(&format!(
                 "  {} counter name {} drop\n",
-                predicate,
-                in_counter
+                predicate, in_counter
             ));
         }
     }
@@ -231,7 +250,9 @@ fn push_prerouting_rule(script: &mut String, rule: &RuleConfig, runtime: Option<
 
 /// Returns whether forward-chain accept rules should remain installed for a rule.
 fn is_rule_active(rule: &RuleConfig, runtime: Option<&RuleRuntimeState>) -> bool {
-    runtime.map(RuleRuntimeState::forwarding_enabled).unwrap_or(rule.enabled)
+    runtime
+        .map(RuleRuntimeState::forwarding_enabled)
+        .unwrap_or(rule.enabled)
 }
 
 /// Builds the stable nftables counter name for a rule/protocol/direction.
@@ -288,7 +309,10 @@ fn apply_counter_delta(
     current_bytes: u64,
     is_incoming: bool,
 ) {
-    let baseline = counters.baselines.entry(counter_name.to_string()).or_default();
+    let baseline = counters
+        .baselines
+        .entry(counter_name.to_string())
+        .or_default();
     if current_bytes < *baseline {
         *baseline = 0;
     }
@@ -309,12 +333,7 @@ fn delete_table(program: &str, args: &[&str]) {
 
 /// Best-effort deletion of a namespace-owned nftables table.
 fn delete_table_in_namespace(config: &Config, args: &[&str]) {
-    let mut command_args = vec![
-        "netns",
-        "exec",
-        config.namespace.as_str(),
-        "nft",
-    ];
+    let mut command_args = vec!["netns", "exec", config.namespace.as_str(), "nft"];
     command_args.extend(args.iter().copied());
     let _ = command::run("ip", command_args);
 }
@@ -332,6 +351,7 @@ mod tests {
             host_veth_ip: "10.200.0.1/30".to_string(),
             ns_veth_ip: "10.200.0.2/30".to_string(),
             state_path: "/tmp/xelay-state.json".into(),
+            log_path: None,
             poll_interval_secs: 2,
             rules: vec![RuleConfig {
                 name: "svc-5000".to_string(),
@@ -340,8 +360,8 @@ mod tests {
                 target: None,
                 target_host: "114.111.191.26".to_string(),
                 target_port: 2616,
-                quota_in: Quota(1),
-                quota_out: Quota(1),
+                quota_in: Some(Quota(1)),
+                quota_out: Some(Quota(1)),
                 max_tcp_connections: 10,
                 max_udp_flows: 20,
                 enabled: true,
@@ -352,7 +372,10 @@ mod tests {
     #[test]
     fn counter_name_sanitizes_rule_name() {
         let config = sample_config();
-        assert_eq!(counter_name(&config.rules[0], &Protocol::Tcp, "in"), "svc_5000_in_tcp");
+        assert_eq!(
+            counter_name(&config.rules[0], &Protocol::Tcp, "in"),
+            "svc_5000_in_tcp"
+        );
     }
 
     #[test]
@@ -376,8 +399,12 @@ mod tests {
 
         let counters = parse_counter_json(raw).unwrap();
         assert_eq!(counters.len(), 2);
-        assert!(counters.iter().any(|c| c.counter_name == "svc_in_tcp" && c.bytes == 100));
-        assert!(counters.iter().any(|c| c.counter_name == "svc_out_tcp" && c.bytes == 250));
+        assert!(counters
+            .iter()
+            .any(|c| c.counter_name == "svc_in_tcp" && c.bytes == 100));
+        assert!(counters
+            .iter()
+            .any(|c| c.counter_name == "svc_out_tcp" && c.bytes == 250));
     }
 
     #[test]
@@ -393,12 +420,18 @@ mod tests {
     fn render_namespace_script_for_enabled_rule_contains_dnat_and_accept() {
         let config = sample_config();
         let mut state = ControllerState::default();
-        state.rules.insert("svc-5000".to_string(), RuleEntryState::default());
+        state
+            .rules
+            .insert("svc-5000".to_string(), RuleEntryState::default());
         let script = render_namespace_script(&config, &state);
         assert!(script.contains("counter svc_5000_in_tcp { }"));
-        assert!(script.contains("ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat to 114.111.191.26:2616"));
+        assert!(script.contains(
+            "ct state new tcp dport 5000 counter name svc_5000_in_tcp dnat to 114.111.191.26:2616"
+        ));
         assert!(script.contains("ip daddr 114.111.191.26 tcp dport 2616 accept"));
-        assert!(script.contains("ip daddr 114.111.191.26 tcp sport 2616 counter name svc_5000_out_tcp accept"));
+        assert!(script.contains(
+            "ip daddr 114.111.191.26 tcp sport 2616 counter name svc_5000_out_tcp accept"
+        ));
     }
 
     #[test]
