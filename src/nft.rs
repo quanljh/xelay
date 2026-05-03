@@ -127,7 +127,8 @@ fn render_host_script(config: &Config) -> String {
                 continue;
             }
             script.push_str(&format!(
-                "  {} dport {} dnat to {}:{}\n",
+                "  iifname \"{}\" {} dport {} dnat to {}:{}\n",
+                config.host_interface,
                 protocol.as_str(),
                 rule.listen_port,
                 config.ns_ip(),
@@ -345,6 +346,7 @@ fn delete_table_in_namespace(config: &Config, args: &[&str]) {
 trait NftOps {
     fn command_exists(&self, program: &str) -> bool;
     fn run(&self, program: &str, args: &[&str]) -> Result<()>;
+    fn output(&self, program: &str, args: &[&str]) -> Result<String>;
 }
 
 /// Installs xelay accept rules into Docker's user-managed forwarding hook.
@@ -356,6 +358,7 @@ fn ensure_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<()> {
         anyhow::bail!("Docker DOCKER-USER chain exists but required command `iptables` is missing");
     }
 
+    prune_docker_user_rules(config, ops)?;
     for rule in docker_user_rules(config) {
         ensure_iptables_rule(ops, &rule)?;
     }
@@ -372,11 +375,7 @@ fn clean_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<()> {
         anyhow::bail!("Docker DOCKER-USER chain exists but required command `iptables` is missing");
     }
 
-    for rule in docker_user_rules(config) {
-        ignore_absent(delete_iptables_rule(ops, &rule))?;
-    }
-
-    Ok(())
+    prune_docker_user_rules(config, ops)
 }
 
 fn docker_user_chain_exists(ops: &dyn NftOps) -> Result<bool> {
@@ -396,6 +395,55 @@ fn ensure_iptables_rule(ops: &dyn NftOps, rule: &[String]) -> Result<()> {
 
 fn delete_iptables_rule(ops: &dyn NftOps, rule: &[String]) -> Result<()> {
     run_iptables_rule(ops, "-D", rule)
+}
+
+fn prune_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<()> {
+    for rule in listed_xelay_docker_user_rules(config, ops)? {
+        ignore_absent(delete_iptables_rule(ops, &rule))?;
+    }
+
+    Ok(())
+}
+
+fn listed_xelay_docker_user_rules(config: &Config, ops: &dyn NftOps) -> Result<Vec<Vec<String>>> {
+    let output = ops.output("iptables", &["-w", "-S", "DOCKER-USER"])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| docker_user_rule_from_save_line(config, line))
+        .collect())
+}
+
+fn docker_user_rule_from_save_line(config: &Config, line: &str) -> Option<Vec<String>> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 3 || tokens[0] != "-A" || tokens[1] != "DOCKER-USER" {
+        return None;
+    }
+
+    let rule = tokens[2..]
+        .iter()
+        .map(|token| token.to_string())
+        .collect::<Vec<_>>();
+    if is_xelay_docker_user_rule(config, &rule) {
+        Some(rule)
+    } else {
+        None
+    }
+}
+
+fn is_xelay_docker_user_rule(config: &Config, rule: &[String]) -> bool {
+    if has_token_pair(rule, "--comment", "xelay") {
+        return true;
+    }
+
+    let host_veth = config.host_veth_name();
+    (has_token_pair(rule, "-i", &host_veth) && has_token_pair(rule, "-o", &config.host_interface))
+        || (has_token_pair(rule, "-i", &config.host_interface)
+            && has_token_pair(rule, "-o", &host_veth))
+}
+
+fn has_token_pair(rule: &[String], key: &str, value: &str) -> bool {
+    rule.windows(2)
+        .any(|window| window[0] == key && window[1] == value)
 }
 
 fn run_iptables_rule(ops: &dyn NftOps, action: &str, rule: &[String]) -> Result<()> {
@@ -420,6 +468,10 @@ fn docker_user_rules(config: &Config) -> Vec<Vec<String>> {
             host_veth.clone(),
             "-o".to_string(),
             config.host_interface.clone(),
+            "-m".to_string(),
+            "comment".to_string(),
+            "--comment".to_string(),
+            "xelay".to_string(),
             "-j".to_string(),
             "ACCEPT".to_string(),
         ],
@@ -432,6 +484,10 @@ fn docker_user_rules(config: &Config) -> Vec<Vec<String>> {
             "conntrack".to_string(),
             "--ctstate".to_string(),
             "RELATED,ESTABLISHED".to_string(),
+            "-m".to_string(),
+            "comment".to_string(),
+            "--comment".to_string(),
+            "xelay".to_string(),
             "-j".to_string(),
             "ACCEPT".to_string(),
         ],
@@ -453,6 +509,10 @@ fn docker_user_rules(config: &Config) -> Vec<Vec<String>> {
                 config.ns_ip().to_string(),
                 "--dport".to_string(),
                 rule.listen_port.to_string(),
+                "-m".to_string(),
+                "comment".to_string(),
+                "--comment".to_string(),
+                "xelay".to_string(),
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ]);
@@ -510,6 +570,10 @@ impl NftOps for SystemNftOps {
     fn run(&self, program: &str, args: &[&str]) -> Result<()> {
         command::run(program, args.iter().copied()).map(|_| ())
     }
+
+    fn output(&self, program: &str, args: &[&str]) -> Result<String> {
+        command::run(program, args.iter().copied()).map(|output| output.stdout)
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +590,7 @@ mod tests {
         docker_user_exists: bool,
         iptables_exists: bool,
         iptables_check_succeeds: bool,
+        iptables_save: String,
     }
 
     struct ErrorNftOps {
@@ -553,6 +618,16 @@ mod tests {
             }
             Ok(())
         }
+
+        fn output(&self, program: &str, args: &[&str]) -> Result<String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            if program == "iptables" && args == ["-w", "-S", "DOCKER-USER"] {
+                return Ok(self.iptables_save.clone());
+            }
+            Ok(String::new())
+        }
     }
 
     impl NftOps for ErrorNftOps {
@@ -561,6 +636,10 @@ mod tests {
         }
 
         fn run(&self, _program: &str, _args: &[&str]) -> Result<()> {
+            anyhow::bail!("{}", self.message)
+        }
+
+        fn output(&self, _program: &str, _args: &[&str]) -> Result<String> {
             anyhow::bail!("{}", self.message)
         }
     }
@@ -633,8 +712,8 @@ mod tests {
         let script = render_host_script(&sample_config());
         assert!(script.contains("table ip xelay_hostnat"));
         assert!(script.contains("oifname \"eth0\" ip saddr 10.200.0.1/30 masquerade"));
-        assert!(script.contains("tcp dport 5000 dnat to 10.200.0.2:5000"));
-        assert!(script.contains("udp dport 5000 dnat to 10.200.0.2:5000"));
+        assert!(script.contains("iifname \"eth0\" tcp dport 5000 dnat to 10.200.0.2:5000"));
+        assert!(script.contains("iifname \"eth0\" udp dport 5000 dnat to 10.200.0.2:5000"));
     }
 
     #[test]
@@ -680,15 +759,15 @@ mod tests {
 
         assert!(rules
             .iter()
-            .any(|rule| rule == "-i fwd-host -o eth0 -j ACCEPT"));
+            .any(|rule| rule == "-i fwd-host -o eth0 -m comment --comment xelay -j ACCEPT"));
         assert!(rules.iter().any(|rule| {
-            rule == "-i eth0 -o fwd-host -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+            rule == "-i eth0 -o fwd-host -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment xelay -j ACCEPT"
         }));
         assert!(rules.iter().any(|rule| {
-            rule == "-i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+            rule == "-i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT"
         }));
         assert!(rules.iter().any(|rule| {
-            rule == "-i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+            rule == "-i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT"
         }));
     }
 
@@ -711,6 +790,7 @@ mod tests {
             docker_user_exists: true,
             iptables_exists: true,
             iptables_check_succeeds: false,
+            iptables_save: String::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -718,14 +798,14 @@ mod tests {
 
         let calls = ops.calls.borrow();
         assert!(calls.iter().any(|c| {
-            c == "iptables -w -C DOCKER-USER -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+            c == "iptables -w -C DOCKER-USER -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT"
         }));
         assert!(calls.iter().any(|c| {
-            c == "iptables -w -I DOCKER-USER 1 -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+            c == "iptables -w -I DOCKER-USER 1 -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT"
         }));
-        assert!(calls
-            .iter()
-            .any(|c| c == "iptables -w -I DOCKER-USER 1 -i fwd-host -o eth0 -j ACCEPT"));
+        assert!(calls.iter().any(
+            |c| c == "iptables -w -I DOCKER-USER 1 -i fwd-host -o eth0 -m comment --comment xelay -j ACCEPT"
+        ));
     }
 
     #[test]
@@ -734,6 +814,7 @@ mod tests {
             docker_user_exists: true,
             iptables_exists: true,
             iptables_check_succeeds: true,
+            iptables_save: String::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -750,6 +831,7 @@ mod tests {
             docker_user_exists: true,
             iptables_exists: false,
             iptables_check_succeeds: false,
+            iptables_save: String::new(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -765,6 +847,9 @@ mod tests {
             docker_user_exists: true,
             iptables_exists: true,
             iptables_check_succeeds: false,
+            iptables_save: "\
+-A DOCKER-USER -i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT\n"
+                .to_string(),
             calls: RefCell::new(Vec::new()),
         };
 
@@ -772,8 +857,66 @@ mod tests {
 
         let calls = ops.calls.borrow();
         assert!(calls.iter().any(|c| {
-            c == "iptables -w -D DOCKER-USER -i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -j ACCEPT"
+            c == "iptables -w -D DOCKER-USER -i eth0 -o fwd-host -p udp -d 10.200.0.2 --dport 5000 -m comment --comment xelay -j ACCEPT"
         }));
+    }
+
+    #[test]
+    fn docker_user_apply_prunes_stale_xelay_rules_before_insert() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: true,
+            iptables_check_succeeds: false,
+            iptables_save: "\
+-A DOCKER-USER -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 9999 -m comment --comment xelay -j ACCEPT\n"
+                .to_string(),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        ensure_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        let delete_index = calls
+            .iter()
+            .position(|c| c == "iptables -w -D DOCKER-USER -i eth0 -o fwd-host -p tcp -d 10.200.0.2 --dport 9999 -m comment --comment xelay -j ACCEPT")
+            .unwrap();
+        let insert_index = calls
+            .iter()
+            .position(|c| c.starts_with("iptables -w -I DOCKER-USER 1 "))
+            .unwrap();
+        assert!(delete_index < insert_index);
+    }
+
+    #[test]
+    fn docker_user_prune_deletes_legacy_veth_rules_and_preserves_unrelated_rules() {
+        let ops = FakeNftOps {
+            docker_user_exists: true,
+            iptables_exists: true,
+            iptables_check_succeeds: false,
+            iptables_save: "\
+-A DOCKER-USER -s 10.0.0.0/8 -j DROP\n\
+-A DOCKER-USER -i fwd-host -o eth0 -j ACCEPT\n\
+-A DOCKER-USER -i eth0 -o fwd-host -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n\
+-A DOCKER-USER -i eth1 -o docker0 -j ACCEPT\n"
+                .to_string(),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        prune_docker_user_rules(&sample_config(), &ops).unwrap();
+
+        let calls = ops.calls.borrow();
+        assert!(calls
+            .iter()
+            .any(|c| c == "iptables -w -D DOCKER-USER -i fwd-host -o eth0 -j ACCEPT"));
+        assert!(calls.iter().any(|c| {
+            c == "iptables -w -D DOCKER-USER -i eth0 -o fwd-host -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        }));
+        assert!(!calls
+            .iter()
+            .any(|c| c == "iptables -w -D DOCKER-USER -s 10.0.0.0/8 -j DROP"));
+        assert!(!calls
+            .iter()
+            .any(|c| c == "iptables -w -D DOCKER-USER -i eth1 -o docker0 -j ACCEPT"));
     }
 
     #[test]

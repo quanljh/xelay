@@ -126,8 +126,8 @@ table ip xelay_hostnat {
 
 table ip xelay_hostfwd {
  chain prerouting { type nat hook prerouting priority dstnat; policy accept;
-  tcp dport 5000 dnat to 10.200.0.2:5000
-  udp dport 5000 dnat to 10.200.0.2:5000
+  iifname "eth0" tcp dport 5000 dnat to 10.200.0.2:5000
+  iifname "eth0" udp dport 5000 dnat to 10.200.0.2:5000
  }
 }
 ```
@@ -135,7 +135,9 @@ table ip xelay_hostfwd {
 If Docker is installed, Docker may also create an `ip filter` `FORWARD` chain with
 `policy drop`. When the Docker `DOCKER-USER` chain exists, `xelay` installs matching
 accept rules there with `iptables -w` so forwarded traffic can reach the namespace
-without editing Docker-managed chains.
+without editing Docker-managed chains. On each apply/reconcile pass, xelay first
+removes xelay-owned `DOCKER-USER` rules and then installs rules for the current
+config, so stale entries from older configs are not left behind.
 
 Inside the namespace, it deletes the old forwarding table if present:
 
@@ -208,7 +210,7 @@ On each apply/reconcile pass, it recreates its managed tables and installs:
 
 - host-side masquerade rules
 - host-side DNAT rules into the forwarding namespace
-- Docker `DOCKER-USER` accept rules when Docker's forwarding hook exists
+- pruned and refreshed Docker `DOCKER-USER` accept rules when Docker's forwarding hook exists
 - namespace-side DNAT rules to backend targets
 - namespace-side filter rules
 - named nftables counters for inbound and outbound accounting
