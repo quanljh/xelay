@@ -1,0 +1,19 @@
+[package]
+name = "xelay-tc-ebpf-program"
+version = "0.2.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "xelay_tc_ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

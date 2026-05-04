@@ -1,0 +1,22 @@
+{
+  "host_interface": "eth0",
+  "bpf_object_path": "/usr/lib/xelay/xelay-tc-ebpf.o",
+  "state_path": "/var/lib/xelay/tc-ebpf-state.json",
+  "log_path": "/var/log/xelay-tc-ebpf.log",
+  "poll_interval_secs": 2,
+  "rules": [
+    {
+      "name": "svc-5000",
+      "listen_port": 5000,
+      "protocols": ["tcp", "udp"],
+      "target_host": "114.111.191.26",
+      "target_port": 2616,
+      "quota_in": "500GB",
+      "quota_out": "500GB",
+      "max_tcp_connections": 2000,
+      "max_udp_flows": 4000,
+      "enabled": true
+    }
+  ]
+}
+
