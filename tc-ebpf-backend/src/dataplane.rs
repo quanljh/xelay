@@ -37,6 +37,8 @@ pub struct CheckEntry {
 }
 
 pub struct AyaDataplane {
+    /// Loaded BPF object. Keeping it alive keeps owned map/program handles usable
+    /// for the lifetime of the controller process.
     bpf: Option<Ebpf>,
     object_path: PathBuf,
 }
@@ -49,6 +51,11 @@ impl AyaDataplane {
         }
     }
 
+    /// Lazily load the compiled eBPF object.
+    ///
+    /// `status` and `apply` both need map access, so loading is centralized here.
+    /// The object must contain map names from `model.rs` and the program name
+    /// `xelay_tc_ingress`.
     fn load(&mut self) -> Result<&mut Ebpf> {
         if self.bpf.is_none() {
             self.bpf = Some(Ebpf::load_file(&self.object_path).with_context(|| {
@@ -106,11 +113,15 @@ impl Dataplane for AyaDataplane {
         let host_ip = interface::interface_ipv4(&config.host_interface)?;
         let bpf = self.load()?;
 
+        // TC classifiers attach to a qdisc hook. `clsact` provides both ingress
+        // and egress hooks without changing normal queuing behavior.
         qdisc_add_clsact(&config.host_interface).with_context(|| {
             format!("failed to create clsact qdisc on {}", config.host_interface)
         })?;
 
         {
+            // The MVP attaches a single ingress classifier to the public/backend
+            // interface. Packets are rewritten there, then normal routing continues.
             let program: &mut SchedClassifier = bpf
                 .program_mut(PROGRAM_NAME)
                 .context("missing TC classifier program")?
@@ -132,6 +143,8 @@ impl Dataplane for AyaDataplane {
                 .unwrap_or(rule.enabled);
             for protocol in &rule.protocols {
                 let key = RuleKey::new(*protocol, rule.listen_port);
+                // Each protocol/listen-port pair is one direct lookup for the TC
+                // program. Rule names stay in userspace; eBPF gets a compact id.
                 let value = RuleValue::new(
                     rule_id as u32,
                     enabled,
@@ -145,6 +158,8 @@ impl Dataplane for AyaDataplane {
 
         let mut settings: AyaHashMap<_, _, SettingsValue> =
             AyaHashMap::try_from(bpf.map_mut(SETTINGS_MAP).context("missing SETTINGS map")?)?;
+        // Refresh the SNAT source address every reconciliation pass. This handles
+        // hosts where the interface IP changes without rebuilding the BPF object.
         settings.insert(
             SETTINGS_HOST_IPV4,
             SettingsValue {
@@ -161,6 +176,8 @@ impl Dataplane for AyaDataplane {
         let counters: AyaHashMap<_, CounterKey, CounterValue> =
             AyaHashMap::try_from(bpf.map(COUNTERS_MAP).context("missing COUNTERS map")?)?;
 
+        // Return raw samples. Reconciliation owns aggregation because it knows how
+        // rule ids map back to configured rule names.
         let mut samples = Vec::new();
         for item in counters.iter() {
             let (key, value) = item?;

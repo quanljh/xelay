@@ -81,12 +81,20 @@ impl<D: Dataplane> Reconciler<D> {
         let samples = self.dataplane.read_counters().unwrap_or_default();
         merge_counter_samples(&mut state_file.state, &self.config, &samples);
         refresh_rule_states(&self.config, &mut state_file.state);
+        // Push the current runtime decision into BPF maps after counters/state are
+        // refreshed. This mirrors v1's reconcile loop but writes maps instead of
+        // recreating nftables chains.
         self.dataplane.apply(&self.config, &state_file.state)?;
         state_file.save()?;
         Ok(())
     }
 }
 
+/// Decide what the dataplane should do for each rule.
+///
+/// The first TC milestone does not enforce quotas or connection limits yet. Rules
+/// that configure those fields stay enabled and report a deferred-limit state so
+/// operators can see that config was accepted but not enforced.
 pub fn refresh_rule_states(config: &Config, state: &mut ControllerState) {
     for rule in &config.rules {
         let entry = state.ensure_rule(&rule.name);
@@ -105,6 +113,8 @@ pub fn merge_counter_samples(
     config: &Config,
     samples: &[CounterSample],
 ) {
+    // BPF counters are keyed per protocol and direction. Status is rule-oriented,
+    // so aggregate TCP and UDP samples by rule id before writing persisted state.
     let mut totals = BTreeMap::<u32, (u64, u64, u64, u64)>::new();
     for sample in samples {
         if !matches!(sample.protocol, 6 | 17) {

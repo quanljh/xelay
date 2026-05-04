@@ -9,7 +9,9 @@ use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// Public/backend Linux interface where the TC ingress classifier is attached.
     pub host_interface: String,
+    /// Compiled eBPF object loaded by the userspace controller.
     #[serde(default = "default_bpf_object_path")]
     pub bpf_object_path: PathBuf,
     #[serde(default = "default_state_path")]
@@ -124,6 +126,10 @@ impl FromStr for Quota {
 }
 
 impl Config {
+    /// Load, normalize, and validate the v2 config.
+    ///
+    /// The schema intentionally remains close to the v1 nftables backend, but the
+    /// v2 MVP requires literal IPv4 backend targets so eBPF map values are simple.
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
@@ -135,6 +141,8 @@ impl Config {
     }
 
     pub fn requires_monitoring(&self) -> bool {
+        // BPF counters live in kernel maps and should be sampled into persisted
+        // state regularly, so automatic mode chooses `run` for v2.
         true
     }
 

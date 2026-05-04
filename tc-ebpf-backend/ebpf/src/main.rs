@@ -14,6 +14,8 @@ const DIRECTION_IN: u8 = 0;
 const DIRECTION_OUT: u8 = 1;
 const BPF_F_PSEUDO_HDR: u64 = 1 << 4;
 
+// The structs below mirror `src/model.rs` in userspace. They are intentionally
+// `repr(C)` because BPF maps are a binary ABI shared across two crates.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RuleKey {
@@ -93,15 +95,20 @@ pub struct FlowValue {
     pub last_seen_ns: u64,
 }
 
+// Listener table: (protocol, listen_port) -> backend rewrite target.
 #[map]
 static RULES: HashMap<RuleKey, RuleValue> = HashMap::with_max_entries(4096, 0);
 
+// Per-rule counters read by the userspace status/reconcile path.
 #[map]
 static COUNTERS: HashMap<CounterKey, CounterValue> = HashMap::with_max_entries(8192, 0);
 
+// Small runtime settings map. SETTINGS[0] stores the host interface IPv4 address.
 #[map]
 static SETTINGS: HashMap<SettingsKey, SettingsValue> = HashMap::with_max_entries(8, 0);
 
+// Forward and reverse flow maps are separated so reply packets can be looked up
+// without reconstructing the full original client tuple from packet data.
 #[map]
 static FLOWS: LruHashMap<FlowKey, FlowValue> = LruHashMap::with_max_entries(262144, 0);
 
@@ -118,6 +125,8 @@ pub fn xelay_tc_ingress(ctx: TcContext) -> i32 {
 }
 
 fn try_xelay_tc_ingress(mut ctx: TcContext) -> Result<i32, ()> {
+    // Parse only the minimum Ethernet/IPv4/L4 fields needed for the MVP. All
+    // reads go through `ctx.load` so the verifier sees bounds-checked accesses.
     let eth_proto = u16::from_be(load_u16(&ctx, 12)?);
     if eth_proto != ETH_P_IP {
         return Ok(TC_ACT_OK);
@@ -152,6 +161,8 @@ fn try_xelay_tc_ingress(mut ctx: TcContext) -> Result<i32, ()> {
     };
     if let Some(rule) = unsafe { RULES.get(&key) } {
         if rule.enabled != 0 {
+            // Forward path: public listener -> backend. Store enough state for the
+            // reply path before rewriting packet headers.
             bump_counter(rule.rule_id, protocol, DIRECTION_IN, total_len);
             let flow = FlowKey {
                 client_ip_be: src_ip,
@@ -192,10 +203,16 @@ fn try_xelay_tc_ingress(mut ctx: TcContext) -> Result<i32, ()> {
                 rule.target_ip_be,
                 rule.target_port,
             )?;
+            // After rewriting, let the kernel continue normal routing with the new
+            // destination. A later milestone can replace this with explicit FIB or
+            // redirect logic if deployments need tighter control.
             return Ok(TC_ACT_OK);
         }
     }
 
+    // Reverse path: backend reply -> original client. The MVP uses the original
+    // client source port as the host-side NAT port, so this key is compact but can
+    // collide for identical client ports talking to the same backend.
     let reverse = ReverseFlowKey {
         backend_ip_be: src_ip,
         backend_port: src_port,
@@ -243,6 +260,9 @@ fn rewrite_forward(
     new_dst_ip: u32,
     new_dst_port: u16,
 ) -> Result<(), ()> {
+    // Client-to-backend rewrite:
+    //   src client_ip -> host_interface_ip
+    //   dst public_listener_ip:listen_port -> backend_ip:target_port
     rewrite_ipv4(ctx, ip_offset, old_src_ip, new_src_ip, true)?;
     rewrite_ipv4(ctx, ip_offset, old_dst_ip, new_dst_ip, false)?;
     if new_dst_port != old_dst_port {
@@ -274,6 +294,9 @@ fn rewrite_reverse(
     client_port: u16,
     listen_port: u16,
 ) -> Result<(), ()> {
+    // Backend-to-client rewrite:
+    //   src backend_ip:target_port -> public_listener_ip:listen_port
+    //   dst host_interface_ip:nat_port -> original_client_ip:client_port
     rewrite_ipv4(ctx, ip_offset, old_src_ip, public_ip, true)?;
     rewrite_ipv4(ctx, ip_offset, old_dst_ip, client_ip, false)?;
     if listen_port != old_src_port {
@@ -300,7 +323,12 @@ fn rewrite_ipv4(
     new_ip: u32,
     source: bool,
 ) -> Result<(), ()> {
-    let field_offset = if source { ip_offset + 12 } else { ip_offset + 16 };
+    let field_offset = if source {
+        ip_offset + 12
+    } else {
+        ip_offset + 16
+    };
+    // Update the IPv4 header checksum before storing the changed address.
     ctx.l3_csum_replace(ip_offset + 10, old_ip as u64, new_ip as u64, 4)
         .map_err(|_| ())?;
     ctx.store(field_offset, &new_ip, 0).map_err(|_| ())
@@ -328,6 +356,7 @@ fn rewrite_l4_addr(
     new_ip: u32,
 ) -> Result<(), ()> {
     let csum_offset = l4_checksum_offset(protocol, ip_offset)?;
+    // IP address changes affect the TCP/UDP pseudo-header checksum.
     ctx.l4_csum_replace(
         csum_offset,
         old_ip as u64,
@@ -345,6 +374,7 @@ fn rewrite_l4_port(
     new_port: u16,
 ) -> Result<(), ()> {
     let csum_offset = l4_checksum_offset(protocol, ip_offset)?;
+    // Port changes affect the normal TCP/UDP checksum field.
     ctx.l4_csum_replace(csum_offset, old_port as u64, new_port as u64, 2)
         .map_err(|_| ())
 }
